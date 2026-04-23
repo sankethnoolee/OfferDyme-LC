@@ -1,0 +1,43 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: offerdyne-backend
+
+  datasource:
+    url: jdbc:h2:mem:offerdyne;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql
+
+  jpa:
+    hibernate:
+      ddl-auto: none              # schema.sql owns the schema
+    defer-datasource-initialization: true
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+logging:
+  level:
+    ai.creditnirvana.offerdyne: INFO
+    org.hibernate.SQL: INFO
+
+offerdyne:
+  negotiation:
+    opening-offer-percent-of-ceiling: 1.00   # start at ceiling
+    lower-step-percent: 7.50                 # step-down amount (5-10% band)
+    max-turns-before-escalate: 10

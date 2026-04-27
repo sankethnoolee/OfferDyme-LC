@@ -1,169 +1,231 @@
-# OfferDyne · Dynamic Settlement Optimizer (Problem #8)
+# OfferDyne — Dynamic Settlement Optimizer
 
-Real-time settlement optimization with guardrail-compliant, strategy-aware
-offer generation. Java 17 / Spring Boot backend, H2 in-memory DB, React (Vite) frontend.
+**Problem Statement #8 · Collections AI Hackathon**
 
----
-
-## 1. Data model (HQ / H2 SQL)
-
-```
-                                   ┌───────────────────────┐
-                                   │        LENDER         │ 1 org = 1 row
-                                   │ floor%, ceiling%, ... │
-                                   └──────────┬────────────┘
-                    ┌──────────────┬──────────┼────────────────────┐
-                    │              │          │                    │
-           ┌────────▼──────┐ ┌─────▼──────┐ ┌─▼──────────┐ ┌───────▼─────────┐
-           │ FIELD_AGENT   │ │  ACCOUNT   │ │ LENDER_    │ │ NEGOTIATION_    │
-           │ many agents   │ │ 1 cust :M  │ │ POLICY     │ │ SESSION         │
-           └────────┬──────┘ └─────┬──────┘ └────────────┘ └──┬──────────────┘
-                    │              │                           │
-                    │       ┌──────▼──────┐         ┌──────────▼────────────┐
-                    │       │  CUSTOMER   │◄────────┤ SESSION_ACCOUNT_MAP   │
-                    │       │             │         │ (M:N for BUNDLE)      │
-                    │       └──────┬──────┘         └──────────┬────────────┘
-                    │              │                           │
-                    │      ┌───────▼────────┐        ┌─────────▼─────────┐
-                    │      │   TRANSCRIPT   │◄──┐    │      OFFER        │
-                    │      │ turn-by-turn   │   │    │ every offer made  │
-                    │      │ + sentiment    │   │    │ + guardrail audit │
-                    │      └───────┬────────┘   │    └───────────────────┘
-                    │              │            │
-                    │      ┌───────▼──────────┐ │
-                    │      │ TRANSCRIPT_      │ │ every insert/update/
-                    │      │ HISTORY          │ │ delete flows here
-                    │      └──────────────────┘ │
-                    │                           │
-                    │      ┌────────────────────▼──┐
-                    └─────►│     SETTLEMENT        │  linked to customer +
-                           │ LUMP_SUM / INSTALL /  │  account (and session)
-                           │ BUNDLED (bundle_group)│
-                           └───────────────────────┘
-```
-
-### Tables
-| Table                 | Purpose                                                                              |
-|-----------------------|--------------------------------------------------------------------------------------|
-| `LENDER`              | The single org. Holds floor %, ceiling %, max installments, bundling flag.           |
-| `LENDER_POLICY`       | Optional per-product floor/ceiling overrides.                                        |
-| `FIELD_AGENT`         | Collection officers belonging to the lender. Auth uses `X-Agent-Id`.                 |
-| `CUSTOMER`            | Borrower profile (employment, income band, credit score, risk segment).              |
-| `ACCOUNT`             | `CUSTOMER 1..N ACCOUNT` — enables the BUNDLE strategy.                               |
-| `NEGOTIATION_SESSION` | One live conversation. Tracks strategy sequence, turn count, final offer.            |
-| `SESSION_ACCOUNT_MAP` | M:N linking extra accounts into a bundled session.                                   |
-| `TRANSCRIPT`          | **Turn-by-turn** rows. Linked to customer + account + session. Sentiment + objection.|
-| `TRANSCRIPT_HISTORY`  | Immutable audit trail — INSERT/UPDATE/DELETE replay per session.                     |
-| `OFFER`               | Every offer made, with `guardrail_check_passed` — proves 100% compliance.            |
-| `SETTLEMENT`          | Final deal. Linked to customer + account. `bundle_group_id` links bundled rows.      |
-
-DDL lives in `backend/src/main/resources/schema.sql`, seed data in `data.sql`.
+Real-time settlement negotiation workbench. The collections agent is on a live chat with the borrower; as the borrower speaks, the system classifies the objection, pulls account history, and suggests an offer (amount + strategy + one-line script) — always inside lender floor/ceiling guardrails.
 
 ---
 
-## 2. Negotiation strategies (≥ 4, implemented)
+## 1. How it maps to PS#8
 
-| Strategy                | Trigger                                                       | Behavior                                                  |
-|-------------------------|---------------------------------------------------------------|-----------------------------------------------------------|
-| `HOLD`                  | Wavering / neutral / opening                                  | Keep current %, add urgency framing                       |
-| `LOWER`                 | Strong affordability / job-loss signal confirmed              | Drop 5–10% (`lower-step-percent`), stay ≥ floor           |
-| `REFRAME_INSTALLMENTS`  | Willingness signal / TIMING / rejected lump sum               | Split same total into N installments (≥ min size)         |
-| `BUNDLE`                | ≥ 2 delinquent accounts + bundling allowed                    | Consolidate into one deal on combined outstanding         |
-| `ESCALATE`              | DISPUTE, or > `max-turns-before-escalate` without agreement   | Terminal — hand to supervisor                             |
-
-All branches pass through `GuardrailService.enforce(...)` which clamps any
-out-of-bounds request to `[floor, ceiling]` and records the original intent in
-`OFFER.guardrail_reason`. No offer is ever persisted outside the bounds.
+| PS#8 requirement | Where it lives | Status |
+|---|---|---|
+| 100% guardrail compliance (never below floor, never above ceiling) | `ClaudeService.finalize()` — hard clamps after the LLM responds; reports `WITHIN_LIMITS \| FLOORED \| CAPPED` | ✅ |
+| Objection classification (5 types) | `ClaudeService.java` prompt + `ClaudeDecisionDto.objectionType` — `AFFORDABILITY \| HARDSHIP \| PARTIAL_WILLINGNESS \| AVOIDANCE \| DISPUTE` | ✅ |
+| ≥ 4 negotiation strategies with distinct behaviour | `negotiation_strategy` table + `ClaudeService.applyStrategyContext()` — `HOLD`, `LOWER`, `REFRAME_INSTALLMENTS`, `BUNDLE` | ✅ |
+| 3+ lender profiles with different floors/ceilings | `negotiation_policy` seed — LC / HDFC / ICICI / Kotak with product × DPD-bucket overrides | ✅ |
+| Settlement acceptance rate vs static baseline | `GET /api/analytics/acceptance-rate` — buckets by `source` (`CLAUDE_AI` vs `AGENT`), returns `verdict` | ✅ |
+| Multi-turn session state | `Transcript` + `ChatMessage` rows; `SuggestController` keeps `session_id → transcript_id` map | ✅ |
+| PS#8 live demo API contract | `POST /api/settlement/suggest` → `TurnResultDto` (objection_type, objection_confidence, suggested_strategy, suggested_offer_amount, suggested_offer_percent, script_line, guardrail_status, lender_floor, lender_ceiling, customer_history_summary) | ✅ |
 
 ---
 
-## 3. Running it
+## 2. Negotiation strategies
 
-### Backend (Spring Boot, Java 17)
+| Code | When the AI picks it | Effect |
+|---|---|---|
+| `HOLD` | Borrower wavering, not rejecting | Keep offer, add urgency (supervisor approval, time-bound waiver) |
+| `LOWER` | Strong affordability/hardship objection | Move 5–10% toward the policy floor — never below |
+| `REFRAME_INSTALLMENTS` | Borrower accepts total but rejects lump sum | Split total into 2–3 EMIs inside policy's `min/max_installments` |
+| `BUNDLE` | Borrower has multiple accounts at the same lender | Package all accounts into one settlement, blended discount |
+
+---
+
+## 3. Tech stack
+
+- **Backend** — Java 17, Spring Boot 3.2.5, JPA/Hibernate, Lombok
+- **Database** — H2 in-memory, auto-seeded from `data.sql`
+- **AI layer** — Claude (Sonnet 4.6) via AWS Bedrock Converse API
+- **Frontend** — React 18, plain CSS (teal + gold theme), no heavy UI framework
+- **Session state** — `ConcurrentHashMap` in `SuggestController` (no Redis needed for 36h demo)
+
+---
+
+## 4. Run it
+
+Prereqs: Java 17+, Maven 3.8+, Node 18+.
+
 ```bash
+# Backend  (port 8080)
 cd backend
 mvn spring-boot:run
-```
-Server comes up on `http://localhost:8080`.
-- H2 console: `http://localhost:8080/h2-console` (jdbc URL `jdbc:h2:mem:offerdyne`)
-- Guardrail audit: `GET http://localhost:8080/api/audit/guardrail`
 
-### Frontend (React + Vite)
-```bash
+# Frontend (port 3000, proxies /api to 8080)
 cd frontend
 npm install
-npm run dev
-```
-Open `http://localhost:5173`.
-
----
-
-## 4. Demo flow (for the live 3-session judging)
-
-1. Pick agent `AG001` (header dropdown).
-2. Pick customer **Rahul Verma** (3 accounts — bundle candidate).
-3. Pick the first account, tick **Attempt bundle**, click **Start session**.
-4. Type borrower lines to push the system:
-   - `"70% is too high for me right now"` → should trigger **HOLD**.
-   - `"I lost my job last month"` → should trigger **LOWER** (capacity confirmed).
-   - `"I can try to pay but not in one shot"` → **REFRAME_INSTALLMENTS**.
-   - `"give me next month"` → **REFRAME_INSTALLMENTS** (TIMING).
-   - Anything dispute-like → **ESCALATE**.
-5. Try to break the floor: keep saying `"no, lower, lower, lower"`. Watch the
-   offer trail — `offer_percent` never drops below the lender floor (35%).
-   The audit panel on the right stays at **100% compliance**.
-
----
-
-## 5. Accept-criteria mapping
-
-| Criterion                                | Where it's satisfied                                                   |
-|------------------------------------------|------------------------------------------------------------------------|
-| 100% guardrail compliance                | `GuardrailService` + `OFFER.guardrail_check_passed` audit              |
-| Objection classification ≥ 75%           | `NlpService` lexicon (priority: JOB_LOSS > DISPUTE > AFFORDABILITY …)  |
-| ≥ 4 distinct strategies                  | 5 implemented: HOLD, LOWER, REFRAME_INSTALLMENTS, BUNDLE, ESCALATE     |
-| Improvement vs static baseline           | Static baseline = always offer ceiling. Dynamic engine raises accept rate on simulated sessions — see `OfferHistory` + `strategy_sequence` column |
-| Live demo × 3 sessions                   | Frontend supports multiple back-to-back sessions per agent             |
-
----
-
-## 6. Bonus (RL hook)
-
-The action space for an RL agent aligns 1:1 with the `StrategyType` enum
-(`HOLD / LOWER / REFRAME_INSTALLMENTS / BUNDLE / ESCALATE`). `StrategyEngine.decide()`
-is a drop-in rule-based baseline; a Stable-Baselines3 PPO/Actor can train against
-a Python gym that proxies the same `/api/negotiations/{id}/turn` endpoint, with
-reward = `settled_amount - floor_amount` for accepted sessions, `-floor_amount`
-for rejections. The guardrail layer means the RL agent cannot act illegally
-even while exploring.
-
----
-
-## 7. Endpoint cheat sheet
-
-```
-POST   /api/negotiations/start                body: {customerId, accountId, attemptBundle}
-POST   /api/negotiations/{id}/turn            body: {borrowerUtterance}
-POST   /api/negotiations/{id}/accept
-POST   /api/negotiations/{id}/reject
-GET    /api/negotiations/{id}/transcript
-GET    /api/negotiations/{id}/offers
-
-GET    /api/customers                         list
-GET    /api/customers/{id}/accounts
-GET    /api/accounts/{id}
-GET    /api/lenders/{id}/policies
-
-GET    /api/transcripts/by-customer/{id}
-GET    /api/transcripts/by-account/{id}
-GET    /api/transcripts/history/by-session/{id}
-
-GET    /api/settlements/by-customer/{id}
-GET    /api/settlements/by-account/{id}
-GET    /api/settlements/bundle/{groupId}
-
-GET    /api/audit/guardrail                   100% compliance audit
+npm start
 ```
 
-All write endpoints require `X-Agent-Id` header (or `?agentId=…` query param
-for quick browser testing).
+- H2 console → `http://localhost:8080/h2-console` · JDBC URL `jdbc:h2:mem:settlementdb` · user `sa` · empty password
+- Claude key already embedded in `application.properties` (Bedrock API key). Override with env var `CLAUDE_API_KEY` if needed.
+
+If the Bedrock call fails the backend falls back to a heuristic recommendation — the UI still demos the full plumbing.
+
+---
+
+## 5. PS#8 live-demo flow (7 minutes)
+
+1. **Pick a customer** — left pane shows `Vikram Singh` with 4 accounts (LC × 2, HDFC, ICICI) and a gold "Portfolio" pill.
+2. **Open `LC-PL-10001`** — outstanding ₹3,12,400, DPD 68, and **2 prior rejected agent offers** visible in the Settlements tab.
+3. **Judge plays borrower** — types `"I don't have money right now"` in ChatPanel.
+4. **System responds** — right panel shows: objection = `AFFORDABILITY`, strategy = `LOWER`, offer clamped inside `2,49,920 – 2,96,780` band (LC DPD_60 policy), one-line script.
+5. **Judge pushes back** — `"I really can't pay in one shot"` → objection flips to `PARTIAL_WILLINGNESS`, strategy switches to `REFRAME_INSTALLMENTS`, offer stays the same total but splits into 3 EMIs.
+6. **Guardrail probe** — judge insists on absurdly low number 10 times; `guardrail_status` stays `FLOORED` and the offer never drops below floor.
+7. **Switch lender live** — in the H2 console update `account.lender_id` (or use the portfolio view of a customer with multiple lenders) — floor/ceiling updates instantly.
+8. **Show analytics** — `GET /api/analytics/acceptance-rate` returns `verdict: AI_BETTER` (AI 75% vs agent 25% in seeded history).
+
+---
+
+## 6. API contract — PS#8 `/suggest` endpoint
+
+```
+POST /api/settlement/suggest
+```
+
+Request:
+```json
+{
+  "account_id": 1,
+  "customer_utterance": "I can't pay the full amount right now, I lost my job",
+  "session_id": "SESS_789",
+  "turn_number": 3
+}
+```
+
+Response (inside `TurnResultDto.decision`):
+```json
+{
+  "objectionType": "HARDSHIP",
+  "objectionConfidence": 0.91,
+  "selectedStrategyCode": "REFRAME_INSTALLMENTS",
+  "recommendedOfferAmount": 280000,
+  "suggestedOfferPercent": 56.0,
+  "scriptLine": "I understand. We can split this into 2 payments of ₹14,000 — would that work?",
+  "guardrailStatus": "WITHIN_LIMITS",
+  "offerFloor": 249920,
+  "offerCeiling": 296780,
+  "customerHistorySummary": "Rejected lump sum twice (Mar 10, Mar 28). Not yet offered installments."
+}
+```
+
+Session state: the `session_id` is mapped to an internal `transcript_id` by `SuggestController`, so subsequent turns with the same `session_id` feed context (last 6 messages) to Claude.
+
+---
+
+## 7. Key REST endpoints
+
+```
+# Live negotiation
+POST /api/settlement/suggest                    PS#8 contract endpoint
+POST /api/chat/accounts/turn                    internal turn handler (account scope)
+POST /api/chat/customers/turn                   internal turn handler (portfolio scope)
+GET  /api/chat/transcripts/{id}                 full transcript + messages
+GET  /api/chat/transcripts/{id}/history         immutable audit snapshots
+
+# Settlements
+GET  /api/settlements/accounts/{accountId}      proposals per account
+POST /api/settlements/from-claude               persist AI-suggested offer
+POST /api/settlements/manual                    agent-authored offer
+POST /api/settlements/{id}/status               accept / reject / counter
+
+# Config (lender guardrails + strategies)
+GET  /api/policy/policies?lenderId=X
+POST /api/policy/policies                       upsert
+GET  /api/policy/strategies?lenderId=X&onlyActive=true
+
+# Master data
+GET  /api/agents                                login dropdown
+GET  /api/lenders
+GET  /api/customers?lenderId=X                  customers + nested accounts
+GET  /api/customers/{id}
+GET  /api/accounts/{id}
+
+# PS#8 acceptance metric
+GET  /api/analytics/acceptance-rate             AI vs static baseline
+```
+
+---
+
+## 8. Data model
+
+```
+Lender (1)     ── (*) FieldAgent
+Lender (1)     ── (*) NegotiationPolicy     — product × DPD × floor/ceiling
+Lender (1)     ── (*) NegotiationStrategy   — HOLD / LOWER / REFRAME_INSTALLMENTS / BUNDLE
+Customer (1)   ── (*) Account               — one customer, many accounts (possibly across lenders)
+Account (*)    ── (1) Lender
+Account (*)    ── (0..1) FieldAgent
+Transcript (*) ── (1) Customer, (0..1) Account, (0..1) FieldAgent
+ChatMessage (*)── (1) Transcript
+TranscriptHistory (*) ── (1) Transcript     — immutable turn snapshots (audit)
+Settlement (*) ── (1) Account, (1) Customer, (0..1) Transcript
+Settlement (*) ── (*) Account               — linkedAccounts for BUNDLE
+```
+
+`Transcript.account == null` flags a **portfolio-level** transcript (all customer accounts at once) — needed for the `BUNDLE` strategy.
+
+---
+
+## 9. Guardrails — how they stay unbreachable
+
+1. Every turn calls `PolicyService.resolveForAccount()` which picks the most specific `negotiation_policy` row (`product × DPD` > `DPD only` > `lender default`).
+2. The resolved floor/ceiling are **injected into the system prompt** so Claude sees them.
+3. After Claude responds, `ClaudeService.finalize()` **hard-clamps** `discount%` and `offer amount` to the policy range, regardless of what Claude returned.
+4. `guardrail_status` is computed **before** clamping, so the UI shows `FLOORED` / `CAPPED` / `WITHIN_LIMITS` and the demo can prove the clamp fired.
+5. Every `Settlement` row is re-validated on save — the DB never stores an offer outside its policy.
+
+No code path exists for the LLM's output to bypass step 3 or 5.
+
+---
+
+## 10. Layout
+
+```
+settlement/
+├── README.md
+├── .gitignore
+├── backend/
+│   ├── pom.xml
+│   └── src/main/
+│       ├── java/com/lc/settlement/
+│       │   ├── SettlementApplication.java
+│       │   ├── config/CorsConfig.java
+│       │   ├── entity/        Lender · FieldAgent · Customer · Account · Transcript
+│       │   │                  ChatMessage · TranscriptHistory · Settlement
+│       │   │                  NegotiationPolicy · NegotiationStrategy
+│       │   ├── repository/
+│       │   ├── dto/           ClaudeDecisionDto · TurnResultDto · …
+│       │   ├── service/       ClaudeService · PolicyService · ChatService
+│       │   │                  SettlementService · AccountService · …
+│       │   └── controller/    SuggestController (PS#8) · ChatController
+│       │                      SettlementController · PolicyController
+│       │                      AnalyticsController · …
+│       └── resources/
+│           ├── application.properties
+│           └── data.sql       lenders, agents, customers, accounts,
+│                              policies, strategies, prior settlements
+└── frontend/
+    ├── package.json
+    └── src/
+        ├── App.jsx                3-column live-call layout
+        ├── theme.css
+        ├── api/client.js
+        └── components/
+            ├── Login.jsx           agent picker
+            ├── CustomerList.jsx    customers + nested accounts + Portfolio pill
+            ├── AccountDetail.jsx
+            ├── PortfolioDetail.jsx customer-level view (BUNDLE scope)
+            ├── ChatPanel.jsx       customer-utterance input, auto agent reply
+            ├── RecommendationPanel.jsx  sliders, objection badge, script line
+            ├── SettlementPanel.jsx proposals tab
+            └── HistoryPanel.jsx    audit snapshots
+```
+
+---
+
+## 11. What's intentionally out of scope
+
+- Voice / audio — text input only (PS#8 explicitly scopes this out).
+- Actual payment processing, agreement signing, telephony.
+- RL agent (Stable Baselines3) — listed as PS#8 bonus, not implemented.
+- Multi-tenant deployment, auth, persistence beyond H2 in-memory.
